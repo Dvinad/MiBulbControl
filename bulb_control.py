@@ -338,10 +338,11 @@ def index():
 
 @app.route("/hide_popup", methods=["POST"])
 def hide_popup():
-    global _popup_window
+    global _popup_window, _popup_visible
     try:
         if _popup_window is not None:
             _popup_window.hide()
+        _popup_visible = False
         return jsonify(ok=True)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
@@ -999,6 +1000,12 @@ def _keepalive_loop():
     hello = bytes.fromhex("21310020" + "ff" * 28)
     while True:
         try:
+            # only keep the radios awake while a UI window is open - when both the
+            # setup and popup windows are hidden there is nothing to control, so we
+            # skip the ping instead of hammering the bulbs in the background
+            if not (_setup_visible or _popup_visible):
+                _t.sleep(12)
+                continue
             cfg = load_config()
             for i in cfg["selected"]:
                 ip = cfg["devices"][i].get("ip")
@@ -1037,6 +1044,10 @@ TRAY_COLORS = [
 ]
 
 _window = None
+# tracks whether either UI window is currently shown - the keepalive ping only
+# runs while at least one is visible so we don't hammer the bulbs in the background
+_setup_visible = False
+_popup_visible = False
 
 
 def _tray_do(fn):
@@ -1070,11 +1081,12 @@ def _is_selected(index):
 
 
 def _show_window(icon=None, item=None):
-    global _window
+    global _window, _setup_visible
     try:
         if _window is not None:
             _window.show()
             _window.restore()
+            _setup_visible = True
     except Exception:
         pass
 
@@ -1139,7 +1151,7 @@ _popup_window = None
 
 
 def _show_popup(icon=None, item=None):
-    global _popup_window
+    global _popup_window, _popup_visible
     try:
         if _popup_window is not None:
             try:
@@ -1149,22 +1161,24 @@ def _show_popup(icon=None, item=None):
                     s = screens[0]
                     # x = screen width - popup width (260) - 20px padding
                     x = s.width - 260 - 20
-                    # y = screen height - popup height (360) - 60px taskbar padding
-                    y = s.height - 360 - 150 
+                    # y = screen height - popup height (460) - taskbar padding
+                    y = s.height - 460 - 150
                     _popup_window.move(x, y)
             except Exception:
                 pass
             _popup_window.show()
+            _popup_visible = True
     except Exception:
         pass
 
 
 def _show_setup(icon=None, item=None):
-    global _window
+    global _window, _setup_visible
     try:
         if _window is not None:
             _window.show()
             _window.restore()
+            _setup_visible = True
     except Exception:
         pass
 
@@ -1212,17 +1226,19 @@ if __name__ == "__main__":
         _popup_window = webview.create_window(
             "Bulb Control",
             "http://127.0.0.1:5000/popup",
-            width=260, height=360, resizable=False,
+            width=260, height=460, resizable=False,
             frameless=True, easy_drag=False, on_top=True,
             hidden=True,
         )
         def _hide_setup():
+            global _setup_visible
             if tray_icon is not None:
-                _window.hide(); return False
+                _window.hide(); _setup_visible = False; return False
             return True
 
         def _hide_popup():
-            _popup_window.hide(); return False
+            global _popup_visible
+            _popup_window.hide(); _popup_visible = False; return False
 
         _window.events.closing += _hide_setup
         _popup_window.events.closing += _hide_popup

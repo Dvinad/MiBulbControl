@@ -63,18 +63,19 @@ def load_config():
         except Exception:
             cfg = None
     if not cfg:
-        return {"devices": [], "selected": []}
+        return {"devices": [], "selected": [], "presets": []}
     # migrate old single-bulb format
     if "ip" in cfg and "devices" not in cfg:
         if cfg.get("ip") and cfg.get("token"):
-            return {"devices": [{"name": "My bulb", "ip": cfg["ip"], "token": cfg["token"]}], "selected": [0]}
-        return {"devices": [], "selected": []}
+            return {"devices": [{"name": "My bulb", "ip": cfg["ip"], "token": cfg["token"]}], "selected": [0], "presets": []}
+        return {"devices": [], "selected": [], "presets": []}
     # migrate single active format to multi select
     if "active" in cfg and "selected" not in cfg:
         cfg["selected"] = [cfg["active"]] if cfg.get("active", -1) >= 0 else []
         cfg.pop("active", None)
     cfg.setdefault("devices", [])
     cfg.setdefault("selected", [])
+    cfg.setdefault("presets", [])  # saved color swatches, list of "#rrggbb" strings
     cfg["selected"] = [i for i in cfg["selected"] if 0 <= i < len(cfg["devices"])]
     return cfg
 
@@ -563,6 +564,75 @@ def temp():
         return jsonify(ok=False, error=str(e)), 500
 
 
+@app.route("/status", methods=["POST"])
+def status_route():
+    # read the real live state back from the bulb so the ui/popup can sync their
+    # sliders and color picker to reality instead of showing stale last-set values.
+    # the first selected bulb is used as the representative state for the controls.
+    try:
+        cfg = load_config()
+        if not cfg["selected"]:
+            return jsonify(ok=False, error="no bulb selected"), 400
+        i = cfg["selected"][0]
+        d = cfg["devices"][i]
+        s = _bulb_for(d["ip"], d["token"]).status()
+        out = {
+            "ok": True,
+            "name": d.get("name"),
+            "ip": d.get("ip"),
+            "is_on": bool(s.is_on),
+            "brightness": s.brightness,
+            "color_temp": s.color_temp,
+            "rgb": list(s.rgb) if s.rgb else None,
+            "color_mode": getattr(s.color_mode, "value", None),
+        }
+        return jsonify(out)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+def _norm_hex(v):
+    # accept "#rgb"/"#rrggbb"/"rrggbb" -> lowercase "#rrggbb" or None
+    v = (v or "").strip().lstrip("#").lower()
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    if len(v) != 6 or any(c not in "0123456789abcdef" for c in v):
+        return None
+    return "#" + v
+
+
+@app.route("/presets", methods=["GET"])
+def presets_list():
+    return jsonify(presets=load_config().get("presets", []))
+
+
+@app.route("/presets/add", methods=["POST"])
+def presets_add():
+    try:
+        hexv = _norm_hex((request.json or {}).get("color"))
+        if not hexv:
+            return jsonify(ok=False, error="bad color"), 400
+        cfg = load_config()
+        if hexv not in cfg["presets"]:
+            cfg["presets"].append(hexv)
+            save_full_config(cfg)
+        return jsonify(ok=True, presets=cfg["presets"])
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.route("/presets/delete", methods=["POST"])
+def presets_delete():
+    try:
+        hexv = _norm_hex((request.json or {}).get("color"))
+        cfg = load_config()
+        cfg["presets"] = [p for p in cfg["presets"] if p != hexv]
+        save_full_config(cfg)
+        return jsonify(ok=True, presets=cfg["presets"])
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
 POPUP_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -600,6 +670,16 @@ POPUP_PAGE = r"""<!DOCTYPE html>
     border:1px solid #33334233; border-radius:8px; padding:9px; cursor:pointer; }
   .btns button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
   .hint { font-size:10px; color:var(--muted); text-align:center; margin-top:8px; }
+  .presets { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; align-items:center; justify-content:flex-start; }
+  .pswatch { position:relative; width:22px; height:22px; border-radius:6px; border:1px solid #33334233; cursor:pointer; }
+  .pswatch .del { position:absolute; top:-6px; right:-6px; width:14px; height:14px; border-radius:50%;
+    background:#000; color:#fff; font-size:11px; line-height:14px; text-align:center; display:none;
+    box-shadow:0 0 2px rgba(0,0,0,.6); }
+  .pswatch:hover .del { display:block; }
+  .paddbtn { width:22px; height:22px; border-radius:6px; border:1px dashed var(--muted); background:transparent;
+    color:var(--muted); font-size:15px; line-height:1; cursor:pointer; padding:0;
+    display:flex; align-items:center; justify-content:center; }
+  .paddbtn:hover { color:var(--text); border-color:var(--text); }
 </style>
 </head>
 <body>
@@ -623,7 +703,8 @@ POPUP_PAGE = r"""<!DOCTYPE html>
     <button class="on" onclick="power(true)">On</button>
     <button onclick="power(false)">Off</button>
   </div>
-  <div class="hint">drag square down toward black to dim - or use the slider</div>
+  <div class="presets" id="presets"></div>
+  <div class="hint">tap + to save the current color - hover a swatch and hit ✕ to remove it</div>
 </div>
 <script>
   let hue = 270, sat = 1, val = 1, bright = 100;
@@ -705,8 +786,84 @@ POPUP_PAGE = r"""<!DOCTYPE html>
         el.className="lamp"+(data.selected.includes(i)?" sel":"");
         el.textContent=d.name||d.ip;
         el.onclick=async()=>{ await fetch("/devices/select",{method:"POST",headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({index:i})}); loadLamps(); };
+          body:JSON.stringify({index:i})}); loadLamps(); loadStatus(); };
         box.appendChild(el);
+      });
+    }catch(e){}
+  }
+
+  function rgbToHsv(r,g,b){
+    r/=255; g/=255; b/=255;
+    const mx=Math.max(r,g,b), mn=Math.min(r,g,b), dl=mx-mn;
+    let h=0;
+    if(dl){
+      if(mx===r) h=((g-b)/dl)%6;
+      else if(mx===g) h=(b-r)/dl+2;
+      else h=(r-g)/dl+4;
+      h*=60; if(h<0) h+=360;
+    }
+    return {h:h, s:mx?dl/mx:0, v:mx};
+  }
+
+  // pull the bulb's real state and move the controls to match it
+  async function loadStatus(){
+    try{
+      const s=await(await fetch("/status",{method:"POST"})).json();
+      if(!s.ok) return;
+      if(typeof s.brightness==="number"){
+        bright=Math.max(1,Math.min(100,s.brightness));
+        slider.value=bright;
+        document.getElementById("bval").textContent=bright;
+        document.getElementById("knob").style.top=((1-bright/100)*100)+"%";
+      }
+      if(s.rgb){
+        const c=rgbToHsv(s.rgb[0],s.rgb[1],s.rgb[2]);
+        hue=c.h; sat=c.s;
+        document.getElementById("hueHandle").style.left=(hue/360*100)+"%";
+        document.getElementById("knob").style.left=(sat*100)+"%";
+        drawSquare();
+      }
+    }catch(e){}
+  }
+
+  function hex2(v){ return Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,"0"); }
+  function currentHex(){ const c=hsvToRgb(hue,sat,1); return "#"+hex2(c.r)+hex2(c.g)+hex2(c.b); }
+
+  function applyPreset(hex){
+    const n=parseInt(hex.slice(1),16);
+    const c=rgbToHsv((n>>16)&255,(n>>8)&255,n&255);
+    hue=c.h; sat=c.s;
+    document.getElementById("hueHandle").style.left=(hue/360*100)+"%";
+    document.getElementById("knob").style.left=(sat*100)+"%";
+    drawSquare(); sendColor();
+  }
+
+  async function saveCurrentPreset(){
+    try{ await fetch("/presets/add",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({color:currentHex()})}); }catch(e){}
+    loadPresets();
+  }
+
+  async function loadPresets(){
+    try{
+      const data=await(await fetch("/presets")).json();
+      const box=document.getElementById("presets"); box.innerHTML="";
+      const add=document.createElement("button");
+      add.className="paddbtn"; add.textContent="+"; add.title="save current color";
+      add.onclick=saveCurrentPreset;
+      box.appendChild(add);
+      (data.presets||[]).forEach(hex=>{
+        const sw=document.createElement("div");
+        sw.className="pswatch"; sw.style.background=hex; sw.title=hex;
+        sw.onclick=()=>applyPreset(hex);
+        const del=document.createElement("span");
+        del.className="del"; del.textContent="×";
+        del.onclick=async(ev)=>{ ev.stopPropagation();
+          try{ await fetch("/presets/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({color:hex})}); }catch(e){}
+          loadPresets(); };
+        sw.appendChild(del);
+        box.appendChild(sw);
       });
     }catch(e){}
   }
@@ -723,8 +880,10 @@ POPUP_PAGE = r"""<!DOCTYPE html>
   document.addEventListener('pointerdown', resetHideTimer);
   resetHideTimer();
 
-  drawSquare(); 
+  drawSquare();
   loadLamps();
+  loadStatus();
+  loadPresets();
 </script>
 </body>
 </html>"""
@@ -889,6 +1048,7 @@ PAGE = r"""<!DOCTYPE html>
           await fetch("/devices/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({index:i})});
           setStatus(sel?"deselected "+(d.name||d.ip):"selected "+(d.name||d.ip),"ok");
           loadDevices();
+          loadStatus();
         };
         const del=document.createElement("span");
         del.textContent="✕"; del.style.cursor="pointer"; del.style.color="var(--muted)"; del.style.padding="0 4px";
@@ -983,11 +1143,31 @@ PAGE = r"""<!DOCTYPE html>
   }
   function hexToRgb(hex){ const n=parseInt(hex.slice(1),16); return {r:(n>>16)&255,g:(n>>8)&255,b:n&255}; }
   function sendColor(hex){ call("/color",hexToRgb(hex)); }
+  function rgbToHex(r,g,b){ return "#"+[r,g,b].map(v=>Math.max(0,Math.min(255,v)).toString(16).padStart(2,"0")).join(""); }
+  // read the bulb's real state and move the sliders/color picker to match it
+  async function loadStatus(){
+    try{
+      const s=await (await fetch("/status",{method:"POST"})).json();
+      if(!s.ok) return;
+      if(typeof s.brightness==="number"){
+        const b=Math.max(1,Math.min(100,s.brightness));
+        document.getElementById("bright").value=b;
+        document.getElementById("briteLabel").textContent=b+"%";
+      }
+      if(s.rgb){
+        document.getElementById("picker").value=rgbToHex(s.rgb[0],s.rgb[1],s.rgb[2]);
+      }
+      if(typeof s.color_temp==="number" && s.color_temp){
+        document.getElementById("temp").value=Math.max(1700,Math.min(6500,s.color_temp));
+      }
+    }catch(e){}
+  }
   const presetColors=["#ff3b30","#ff9500","#ffcc00","#34c759","#00c7be","#30b0ff","#007aff","#5856d6","#af52de","#ff2d92","#ffffff","#ff6b9d"];
   const presetsEl=document.getElementById("presets");
   presetColors.forEach(c=>{ const d=document.createElement("div"); d.className="swatch"; d.style.background=c;
     d.onclick=()=>{ document.getElementById("picker").value=c; sendColor(c); }; presetsEl.appendChild(d); });
   loadDevices();
+  loadStatus();
 </script>
 </body>
 </html>"""
